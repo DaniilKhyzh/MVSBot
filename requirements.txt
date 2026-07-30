@@ -1,0 +1,9 @@
+# Requirements for MVSBot
+playwright>=1.40.0
+python-dotenv>=1.0.0
+httpx>=0.25.0
+
+# For development (optional)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
