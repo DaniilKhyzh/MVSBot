@@ -55,56 +55,49 @@ def format_queue_notification(queue_data: dict) -> str:
     Returns:
         Formatted message string for Telegram
     """
-    # Extract relevant information with fallbacks
-    service_id = queue_data.get("service_id", queue_data.get("serviceId", "Unknown"))
-    department_id = queue_data.get("department_id", queue_data.get("departmentId", "Unknown"))
+    # Extract available slots
+    available_slots = queue_data.get("available_slots", [])
 
-    # Handle nested department data
-    dept_info = queue_data.get("department", {})
-    if isinstance(dept_info, dict):
-        dept_name = dept_info.get("name", dept_info.get("title", "Unknown"))
-        available_spots = dept_info.get("available", dept_info.get("available_spots", 0))
-        total_spots = dept_info.get("total", dept_info.get("total_spots", 0))
-    else:
-        dept_name = "Unknown"
-        available_spots = queue_data.get("available_spots", queue_data.get("available", 0))
-        total_spots = queue_data.get("total_spots", queue_data.get("total", 0))
+    if not available_slots:
+        return "No available slots found."
 
-    # Try to get appointment availability or similar meaningful data
-    available_days = queue_data.get("available_days", [])
-    # Handle case where available_days might be a dict with a 'data' key
-    if isinstance(available_days, dict) and 'data' in available_days:
-        available_days = available_days.get('data', [])
+    # Build the message in the required format
+    message_parts = ["🟢 New available slots!\n"]
 
-    message_parts = [
-        "🎟️ <b>Queue Update for MVS Bot</b>",
-        f"Service ID: <b>{service_id}</b>",
-        f"Department ID: <b>{department_id}</b>",
-        f"Department: <b>{dept_name}</b>",
-    ]
+    for slot in available_slots:
+        if isinstance(slot, dict):
+            date = slot.get('date', 'Unknown')
+            times = slot.get('times', [])
 
-    if available_spots is not None:
-        message_parts.append(f"Available Spots: <b>{available_spots}</b>")
+            if times and isinstance(times, list):
+                # Format date (extract YYYY-MM-DD if it's a full timestamp)
+                if 'T' in date:
+                    date_only = date.split('T')[0]
+                else:
+                    date_only = date
 
-    if total_spots is not None:
-        message_parts.append(f"Total Spots: <b>{total_spots}</b>")
+                # Format times (extract HH:MM if they include seconds)
+                formatted_times = []
+                for time_str in times:
+                    if ':' in time_str:
+                        parts = time_str.split(':')
+                        if len(parts) >= 2:
+                            # Take only HH:MM
+                            formatted_times.append(f"{parts[0]}:{parts[1]}")
+                        else:
+                            formatted_times.append(time_str)
+                    else:
+                        formatted_times.append(time_str)
 
-    if available_days:
-        # Format the first few available dates (extract just date part from ISO timestamp)
-        dates = []
-        for day in available_days[:3]:  # Show first 3 dates
-            if isinstance(day, dict) and 'date' in day:
-                # Extract date part from ISO timestamp (YYYY-MM-DD)
-                full_date = day['date']
-                date_only = full_date.split('T')[0] if 'T' in full_date else full_date
-                dates.append(date_only)
-            else:
-                dates.append(str(day))
-        dates_str = ", ".join(dates)
-        message_parts.append(f"Available Dates: <b>{dates_str}</b>")
+                # Add to message
+                message_parts.append(f"📅 {date_only}")
+                for time in formatted_times:
+                    message_parts.append(f"• {time}")
+                message_parts.append("")  # Empty line between dates
 
-    # Add a note about raw data availability (without using unsupported HTML tags)
-    message_parts.append("\n<i>Raw data available in logs for debugging</i>")
+    # Remove the last empty line if exists
+    if message_parts[-1] == "":
+        message_parts.pop()
 
     return "\n".join(message_parts)
 

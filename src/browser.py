@@ -135,11 +135,13 @@ class BrowserManager:
 
     async def get_queue_data(self) -> Optional[dict]:
         """
-        Fetch queue data by making a direct API request to get department information
-        for the selected service and department.
+        Fetch queue data by making two API requests using the authenticated browser session:
+        1. GET /api/v2/equeue/days?serviceId=43&departmentId=93 to get available dates
+        2. For each date, GET /api/v2/equeue/slots?serviceId=43&departmentId=93&date=<date> to get time slots
 
-        Based on the CURL example in the user's message, the endpoint is:
-        https://eqn.hsc.gov.ua/api/v2/equeue/departments?serviceId=43
+        This approach uses Playwright's request functionality which maintains the
+        authenticated browser session, ensuring we have the same cookies and permissions
+        as if we were making the requests from the page itself.
 
         Returns:
             Queue data dictionary if successful, None otherwise.
@@ -148,98 +150,93 @@ class BrowserManager:
             raise RuntimeError("Browser not started. Call start() first.")
 
         try:
-            logger.info("Fetching queue data from API...")
+            logger.info("Fetching queue data via authenticated API requests...")
 
-            # Make request to get departments for the service
-            # Using the page's request context to maintain authentication
-            response = await self.page.request.fetch(
-                f"https://eqn.hsc.gov.ua/api/v2/equeue/departments?serviceId={settings.service_id}",
+            # Get the target department ID and service ID from settings
+            target_department_id = int(settings.department_id)
+            service_id = settings.service_id
+
+            # Step 1: Fetch available dates
+            logger.info(f"Fetching days for service {service_id}, department {target_department_id}")
+            days_response = await self.page.request.fetch(
+                f"https://eqn.hsc.gov.ua/api/v2/equeue/days?serviceId={service_id}&departmentId={target_department_id}",
                 method="GET",
                 headers={
                     "accept": "application/json, text/plain, */*",
                     "accept-language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
                     "referer": "https://eqn.hsc.gov.ua/",
-                }
+                },
+                timeout=30000  # 30 seconds timeout
             )
 
-            if not response.ok:
-                logger.error(f"Failed to fetch department data: {response.status} {response.status_text}")
-                return None
-
-            departments_data = await response.json()
-            logger.info(f"Received departments data: {departments_data}")
-
-            # Find the specific department we're interested in
-            target_department_id = int(settings.department_id)
-            department_info = None
-
-            # Handle different possible response formats
-            departments = None
-            if isinstance(departments_data, list):
-                departments = departments_data
-            elif isinstance(departments_data, dict):
-                # Check if it's wrapped in a common structure
-                if "data" in departments_data and isinstance(departments_data["data"], list):
-                    departments = departments_data["data"]
-                elif "departments" in departments_data and isinstance(departments_data["departments"], list):
-                    departments = departments_data["departments"]
-                else:
-                    # Assume the dict itself contains the department info
-                    departments = [departments_data]
-
-            if departments:
-                for dept in departments:
-                    if isinstance(dept, dict):
-                        dept_id = dept.get("id") or dept.get("departmentId") or dept.get("value")
-                        if dept_id is not None and int(dept_id) == target_department_id:
-                            department_info = dept
-                            break
-
-            if department_info is None:
-                logger.warning(f"Could not find department {target_department_id} in response")
-                # Return the whole response as fallback
-                return departments_data
-
-            # Now try to get more specific queue/day information for this department
-            # Based on the user's curl example, we might want to check days/slots
-            try:
-                days_response = await self.page.request.fetch(
-                    f"https://eqn.hsc.gov.ua/api/v2/equeue/days?serviceId={settings.service_id}&departmentId={target_department_id}",
-                    method="GET",
-                    headers={
-                        "accept": "application/json, text/plain, */*",
-                        "accept-language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "referer": "https://eqn.hsc.gov.ua/",
-                    }
-                )
-
-                if days_response.ok:
-                    days_data = await days_response.json()
-                    # Combine department info with days info
-                    result = {
-                        "department": department_info,
-                        "available_days": days_data,
-                        "service_id": settings.service_id,
-                        "department_id": settings.department_id
-                    }
-                    return result
-                else:
-                    logger.warning(f"Could not fetch days data: {days_response.status}")
-                    # Still return department info
-                    return {
-                        "department": department_info,
-                        "service_id": settings.service_id,
-                        "department_id": settings.department_id
-                    }
-
-            except Exception as e:
-                logger.warning(f"Error fetching days data: {e}")
-                # Return just the department info
+            if not days_response.ok:
+                logger.error(f"Failed to fetch days data: {days_response.status} {days_response.status_text}")
+                # Return basic structure even if we can't get days
                 return {
-                    "department": department_info,
-                    "service_id": settings.service_id,
-                    "department_id": settings.department_id
+                    "department": {"id": target_department_id},
+                    "available_slots": [],
+                    "service_id": service_id,
+                    "department_id": target_department_id
                 }
+
+            days_data = await days_response.json()
+            # Extract data array if wrapped
+            if isinstance(days_data, dict) and "data" in days_data:
+                days_data = days_data["data"]
+
+            logger.info(f"Received days data with {len(days_data) if isinstance(days_data, list) else 0} entries")
+
+            # Step 2: For each date, fetch time slots
+            available_slots = []
+            if isinstance(days_data, list):
+                for day_item in days_data:
+                    if isinstance(day_item, dict) and 'date' in day_item:
+                        date_str = day_item['date']
+                        # Extract date part from ISO timestamp (YYYY-MM-DD)
+                        if 'T' in date_str:
+                            date_only = date_str.split('T')[0]
+                        else:
+                            date_only = date_str
+
+                        # Fetch time slots for this date
+                        slots_response = await self.page.request.fetch(
+                            f"https://eqn.hsc.gov.ua/api/v2/equeue/slots?serviceId={service_id}&departmentId={target_department_id}&date={date_only}",
+                            method="GET",
+                            headers={
+                                "accept": "application/json, text/plain, */*",
+                                "accept-language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+                                "referer": "https://eqn.hsc.gov.ua/",
+                            },
+                            timeout=30000  # 30 seconds timeout
+                        )
+
+                        times = []
+                        if slots_response.ok:
+                            slots_data = await slots_response.json()
+                            # Handle different possible response formats
+                            if isinstance(slots_data, list):
+                                times = slots_data
+                            elif isinstance(slots_data, dict) and "data" in slots_data:
+                                times = slots_data["data"]
+                            else:
+                                logger.warning(f"Unexpected slots data format for date {date_only}: {slots_data}")
+                        else:
+                            logger.error(f"Failed to fetch slots for date {date_only}: {slots_response.status} {slots_response.status_text}")
+
+                        available_slots.append({
+                            "date": date_only,
+                            "times": times
+                        })
+                    else:
+                        logger.warning(f"Unexpected day item format: {day_item}")
+
+            result = {
+                "department": {"id": target_department_id},
+                "available_slots": available_slots,
+                "service_id": service_id,
+                "department_id": target_department_id
+            }
+            return result
 
         except Exception as e:
             logger.error(f"Error fetching queue data: {e}")
