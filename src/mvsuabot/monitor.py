@@ -175,9 +175,8 @@ async def _check(settings: Settings, session: SessionManager | None = None, stat
     total_days = len(days)
     num_batches = (total_days + 6) // 7
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await _safe_notify(
-        f"[{timestamp}] 📅 Виявлено {total_days} днів. Починаю перевірку у {num_batches} пакетах.",
-        settings,
+    state.logger.info(
+        f"[{timestamp}] 📅 Виявлено {total_days} днів. Починаю перевірку у {num_batches} пакетах."
     )
 
     # Check all available days in batches of 7 and wait between batches.
@@ -193,10 +192,6 @@ async def _check(settings: Settings, session: SessionManager | None = None, stat
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         batch_days_label = ", ".join(batch_days)
         state.logger.info(f"Checking days {batch_label}: {batch_days_label}")
-        await _safe_notify(
-            f"[{timestamp}] 🔎 Fetching days {batch_label}: {batch_days_label}",
-            settings,
-        )
 
         batch_slots: list[Slot] = []
         for i, day in enumerate(batch_days):
@@ -233,9 +228,8 @@ async def _check(settings: Settings, session: SessionManager | None = None, stat
 
         batch_slot_count = len(batch_slots)
         batch_summary = _short_availability_summary(batch_slots)
-        await _safe_notify(
-            f"[{timestamp}] ✅ Batch {batch_label} complete: fetched {len(batch_days)} days, {batch_slot_count} slots.\n{batch_summary}",
-            settings,
+        state.logger.info(
+            f"[{timestamp}] ✅ Batch {batch_label} complete: fetched {len(batch_days)} days, {batch_slot_count} slots. {batch_summary}"
         )
 
         if batch_start + MAX_DAYS_TO_CHECK < total_days:
@@ -254,30 +248,47 @@ async def _check(settings: Settings, session: SessionManager | None = None, stat
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     slots_changed = set(previous_slots) != set(slots)
-    state_changed = first_check or days != previous_days or slots_changed
+    days_changed = set(previous_days) != set(days)
+    state_changed = first_check or slots_changed or days_changed
 
     if state_changed:
         if availability.has_slots:
             short_summary = _short_availability_summary(slots)
-            await _safe_notify(
-                f"[{timestamp}] ✅ Знайдено доступні слоти. {short_summary}\nПеревірте кабінет вручну.",
-                settings,
-            )
+            if first_check or not previous_slots:
+                await _safe_notify(
+                    f"[{timestamp}] 🎯 Знайдено доступні слоти!\n{short_summary}\n\n{availability.summary}\n\nПеревірте кабінет МВС.",
+                    settings,
+                )
+            else:
+                added_slots = set(slots) - set(previous_slots)
+                removed_slots = set(previous_slots) - set(slots)
+                diff_parts = []
+                if added_slots:
+                    diff_parts.append(f"➕ {len(added_slots)} нових")
+                if removed_slots:
+                    diff_parts.append(f"➖ {len(removed_slots)} зайнято")
+                diff_str = f" ({', '.join(diff_parts)})" if diff_parts else ""
+
+                await _safe_notify(
+                    f"[{timestamp}] 🔄 Зміна доступних слотів{diff_str}:\n{short_summary}\n\n{availability.summary}",
+                    settings,
+                )
             HAS_REPORTED_THIS_RUN = True
             return True
         elif not days:
-            await _safe_notify(
-                f"[{timestamp}] Перевірка активна: календар повернув data: [], доступних днів немає.",
-                settings,
-            )
+            if first_check or previous_days:
+                await _safe_notify(
+                    f"[{timestamp}] ℹ️ Календар порожній: доступних днів наразі немає.",
+                    settings,
+                )
         else:
-            summary = _short_availability_summary(slots)
-            await _safe_notify(
-                f"[{timestamp}] 🔄 Зміна календаря: {summary}",
-                settings,
-            )
+            if previous_slots:
+                await _safe_notify(
+                    f"[{timestamp}] ❌ Слоти більше недоступні (усі слоти зайнято).",
+                    settings,
+                )
     else:
-        state.logger.info(f"[{timestamp}] Без змін: {_short_availability_summary(slots)}")
+        state.logger.info(f"[{timestamp}] 💤 Без змін: {_short_availability_summary(slots)}")
 
     HAS_REPORTED_THIS_RUN = True
     return availability.has_slots

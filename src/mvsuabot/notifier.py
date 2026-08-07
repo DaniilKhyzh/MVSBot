@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 import httpx
+
+logger = logging.getLogger(__name__)
 
 TELEGRAM_MESSAGE_MAX_LENGTH = 3800
 
@@ -41,12 +45,14 @@ async def notify(
     telegram_chat_id: str | None,
 ) -> None:
     if not telegram_bot_token or not telegram_chat_id:
+        logger.warning("Telegram credentials missing; printing notification instead: %s", message)
         print(message, flush=True)
         return
 
     telegram_bot_token = telegram_bot_token.strip()
     telegram_chat_id = telegram_chat_id.strip()
     if not telegram_bot_token or not telegram_chat_id:
+        logger.warning("Telegram credentials missing after stripping; printing notification instead: %s", message)
         print(message, flush=True)
         return
 
@@ -64,17 +70,20 @@ async def notify(
                 response.raise_for_status()
                 data = response.json()
                 if not data.get("ok", False):
+                    logger.error("Telegram API error: %s", data.get("description", data))
                     print(
                         f"Telegram API error: {data.get('description', data)}",
                         flush=True,
                     )
             except httpx.HTTPError as exc:
+                logger.exception("Failed to send Telegram message: %s", exc)
                 print(
                     f"Не вдалося надіслати Telegram-повідомлення: {exc}",
                     flush=True,
                 )
                 break
             except Exception as exc:
+                logger.exception("Unexpected error while sending Telegram message: %s", exc)
                 print(
                     f"Помилка при відправці Telegram-повідомлення: {exc}",
                     flush=True,

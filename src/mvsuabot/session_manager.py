@@ -16,13 +16,16 @@ from urllib.parse import urlencode
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from mvsuabot.authentication_manager import AuthenticationManager
 from mvsuabot.availability import parse_days
 from mvsuabot.config import Settings
 from mvsuabot.equeue import EqueueRateLimitError
+from mvsuabot.notifier import notify
 
 
 EQUEUE_BASE = "https://eqn.hsc.gov.ua"
 CABINET_URL = f"{EQUEUE_BASE}/cabinet"
+PRE_AUTH_ATTEMPTS = 4
 
 
 class SessionExpiredError(RuntimeError):
@@ -128,7 +131,7 @@ def auth_page_kind(url: str) -> str:
     url_lower = url.lower()
     if "eqn.hsc.gov.ua" in url_lower:
         return "mvs_login"
-    if "id.gov.ua/bankid-nbu-auth" in url_lower:
+    if "id.bank.gov.ua" in url_lower or "id.gov.ua/bankid-nbu-auth" in url_lower:
         return "bankid_bank_select"
     if "id.gov.ua/bankid-auth-callback" in url_lower:
         return "bankid_callback"
@@ -209,6 +212,7 @@ class SessionManager:
         self._fetch_lock = asyncio.Lock()
         self._gateway_error_reported = False
         self._ready_days: list[str] | None = None
+        self._monitor_start_notified = False
         self.logger = logging.getLogger(__name__)
 
     async def start(self, settings: Settings) -> None:
@@ -254,6 +258,10 @@ class SessionManager:
         page = self._page
         if page.url in ("about:blank", "") or "eqn.hsc.gov.ua" not in page.url:
             await self._open_cabinet_once()
+
+        auth_completed = await self._run_pre_auth_flow(settings)
+        if not auth_completed:
+            self.logger.warning("Pre-authentication flow did not complete after restart; continuing to existing readiness logic.")
 
         await self._wait_for_calendar_ready(settings)
         self._ready = True
@@ -315,8 +323,65 @@ class SessionManager:
         except Exception:
             self.logger.info(navigation_timeout_hint(CABINET_URL))
 
+    async def _run_pre_auth_flow(self, settings: Settings) -> bool:
+        page = self._page
+        assert page is not None
+
+        for attempt in range(1, PRE_AUTH_ATTEMPTS + 1):
+            if page.is_closed():
+                raise BrowserClosedError("Вікно браузера закрите.")
+
+            try:
+                body_text = await page.locator("body").inner_text()
+                if AuthenticationManager.is_authentication_completed(page.url, body_text) or AuthenticationManager.is_registration_button_visible(body_text):
+                    self.logger.info("Already authenticated in cabinet. Pre-authentication flow complete.")
+                    return True
+            except Exception:
+                pass
+
+            auth_manager = AuthenticationManager(page, settings)
+            if await auth_manager.run():
+                return True
+
+            try:
+                body_text = await page.locator("body").inner_text()
+                if AuthenticationManager.is_authentication_completed(page.url, body_text) or AuthenticationManager.is_registration_button_visible(body_text):
+                    self.logger.info("Authenticated in cabinet after attempt. Pre-authentication flow complete.")
+                    return True
+            except Exception:
+                pass
+
+            if attempt >= PRE_AUTH_ATTEMPTS:
+                break
+
+            self.logger.warning(
+                "Pre-authentication flow did not complete. Reloading the service portal and starting again from the beginning."
+            )
+            try:
+                current_url = page.url.lower()
+                if "eqn.hsc.gov.ua" not in current_url or ("/cabinet" not in current_url and "/queue" not in current_url):
+                    await page.goto(EQUEUE_BASE, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                else:
+                    self.logger.info("Already on cabinet page (%s); waiting for content to load.", page.url)
+                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except Exception as exc:
+                if "ERR_ABORTED" in str(exc) or "net::ERR_ABORTED" in str(exc):
+                    self.logger.info("Page reload aborted due to active redirect; waiting for load state.")
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                    except Exception:
+                        pass
+                else:
+                    self.logger.info(navigation_timeout_hint(EQUEUE_BASE))
+
+        return False
+
     async def _wait_for_calendar_ready(self, settings: Settings) -> None:
-        self.logger.info(calendar_setup_instructions(settings))
+        if not (settings.auto_login_steps and not getattr(self, "_exam_navigated", False)):
+            self.logger.info(calendar_setup_instructions(settings))
+        else:
+            self.logger.info("Авторизацію підтверджено. Переходжу до авто-вибору послуги...")
 
         poll_seconds = 8
         deadline = asyncio.get_event_loop().time() + 600
@@ -327,10 +392,28 @@ class SessionManager:
             if page.is_closed():
                 raise BrowserClosedError("Вікно браузера закрите.")
 
-            # After login, perform the service selection sequence once
-            if settings.auto_login_steps and not getattr(self, "_exam_navigated", False):
+            try:
+                body_text = await page.text_content("body") or ""
+            except Exception:
+                body_text = ""
+
+            if page_shows_gateway_error(body_text):
+                if not self._gateway_error_reported:
+                    self.logger.info(gateway_error_hint())
+                    self._gateway_error_reported = True
+                await asyncio.sleep(30)
+                continue
+
+            is_authenticated = (
+                page_looks_like_authenticated_cabinet(page.url, body_text)
+                or AuthenticationManager.is_registration_button_visible(body_text)
+            )
+
+            # After login, perform the service selection sequence once when authenticated
+            if settings.auto_login_steps and not getattr(self, "_exam_navigated", False) and is_authenticated:
                 try:
                     self.logger.info("Starting service selection flow...")
+                    await self._notify_monitor_start_once()
 
                     # Step 1: Click "Записатись у чергу" button
                     self.logger.info('Clicking "Записатись у чергу" button')
@@ -375,20 +458,8 @@ class SessionManager:
                 except Exception as exc:
                     self.logger.error(f"Service selection flow failed: {exc}")
 
-            try:
-                body_text = await page.text_content("body") or ""
-
-            except Exception:
-                body_text = ""
-
-            if page_shows_gateway_error(body_text):
-                if not self._gateway_error_reported:
-                    self.logger.info(gateway_error_hint())
-                    self._gateway_error_reported = True
-                await asyncio.sleep(30)
-                continue
-
             if page_looks_like_authenticated_cabinet(page.url, body_text):
+                await self._notify_monitor_start_once()
                 return
 
             poll_seconds = min(poll_seconds + 10, 60)
@@ -400,6 +471,25 @@ class SessionManager:
             "Переконайтесь, що ви дійшли до календаря для serviceId="
             f"{settings.service_id}, departmentId={settings.department_id}."
         )
+
+    async def _notify_monitor_start_once(self) -> None:
+        if self._monitor_start_notified:
+            return
+
+        message = (
+            "🔔 Новий сеанс запущено. "
+            "Session manager стартував, починаю UI-кроки в кабінеті МВС."
+        )
+        self.logger.info("Sending startup notification before UI clicks.")
+        try:
+            await notify(
+                message,
+                telegram_bot_token=self._settings.telegram_bot_token if self._settings else None,
+                telegram_chat_id=self._settings.telegram_chat_id if self._settings else None,
+            )
+            self._monitor_start_notified = True
+        except Exception as exc:
+            self.logger.error("Startup notification failed: %s", exc)
 
     async def _fetch(self, url: str) -> tuple[int, str]:
         async with self._fetch_lock:
